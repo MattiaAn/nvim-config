@@ -7,8 +7,15 @@ vim.opt.fileformats = { "unix", "dos" }
 vim.cmd("packadd nvim.undotree")
 vim.keymap.set("n", "<leader>u", require("undotree").open)
 
--- Neovim Python provider
-vim.g.python3_host_prog = [[C:\Users\mattiaan\AppData\Local\Programs\Python\Python312\python.exe]]
+-- Neovim Python provider: use an available interpreter instead of a
+-- machine- and version-specific path.
+local python3_host = vim.fn.exepath("python3")
+if python3_host == "" then
+  python3_host = vim.fn.exepath("python")
+end
+if python3_host ~= "" then
+  vim.g.python3_host_prog = python3_host
+end
 -- Keep Unicode output intact for Python tools such as render-markdown's
 -- latex2text converter on Windows.
 vim.env.PYTHONUTF8 = "1"
@@ -268,7 +275,6 @@ require("lazy").setup({
     -- refer to the configuration section below
     }
   },
-  { "madox2/vim-ai" },
   { "lervag/vimtex" },
   {
     "JoosepAlviste/nvim-ts-context-commentstring",
@@ -364,36 +370,6 @@ require("lazy").setup({
       end,
     })
 
-  vim.api.nvim_create_autocmd("BufWritePre", {
-    pattern = "*.py",
-    callback = function()
-      -- Fix all auto-fixable Ruff problems
-      vim.lsp.buf.code_action({
-        context = {
-          only = { "source.fixAll.ruff" },
-          diagnostics = {},
-        },
-        apply = true,
-      })
-
-      -- Organize imports with Ruff
-      vim.lsp.buf.code_action({
-        context = {
-          only = { "source.organizeImports.ruff" },
-          diagnostics = {},
-        },
-        apply = true,
-      })
-
-      -- Format with Ruff
-      vim.lsp.buf.format({
-        async = false,
-        filter = function(client)
-          return client.name == "ruff"
-        end,
-      })
-    end,
-  })
   end,
   },
 {
@@ -1219,13 +1195,8 @@ vim.keymap.set("n", "j", "gj", { noremap = true })
 vim.keymap.set("n", "k", "gk", { noremap = true })
 
 -- Buffers
-vim.keymap.set("n", "<leader>b", "<cmd>Buffers<CR>", { noremap = true, desc = "FZF buffers" })
 vim.keymap.set("n", "<leader>n", "<cmd>bnext<CR>", { noremap = true, desc = "Next buffer" })
 vim.keymap.set("n", "<leader>p", "<cmd>bprevious<CR>", { noremap = true, desc = "Previous buffer" })
-
--- FZF
-vim.keymap.set("n", "<leader>f", "<cmd>Files<CR>", { noremap = true, desc = "FZF files" })
-vim.keymap.set("n", "<leader>rg", "<cmd>Rg<CR>", { noremap = true, desc = "Ripgrep" })
 
 -- ============================================================
 -- UltiSnips
@@ -1255,6 +1226,43 @@ vim.g.vimtex_view_general_options =
 vim.g.vimtex_quickfix_open_on_warning = 0
 vim.g.vimtex_complete_enabled = 1
 vim.g.vimtex_fold_enabled = 1
+
+-- Reflow terminal/GUI pastes in LaTeX using the buffer's TeX formatter.
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = { "tex", "plaintex", "latex" },
+  callback = function()
+    vim.bo.textwidth = 80
+  end,
+})
+
+local original_paste = vim.paste
+local tex_paste_start
+vim.paste = function(lines, phase)
+  if phase == -1 or phase == 1 then
+    local ft = vim.bo.filetype
+    tex_paste_start = (ft == "tex" or ft == "plaintex" or ft == "latex")
+      and vim.fn.mode():match("^[ni]")
+      and { buf = vim.api.nvim_get_current_buf(), row = vim.fn.line(".") }
+      or nil
+  end
+  local result = original_paste(lines, phase)
+  if phase == -1 or phase == 3 then
+    local start = tex_paste_start
+    tex_paste_start = nil
+    if result ~= false and start and start.buf == vim.api.nvim_get_current_buf() then
+      local last = vim.fn.line(".")
+      -- Work backwards so new line breaks do not shift the remaining rows.
+      for row = last, start.row, -1 do
+        local line = vim.api.nvim_buf_get_lines(0, row - 1, row, false)[1]
+        if vim.fn.strdisplaywidth(line) > vim.bo.textwidth and vim.bo.textwidth > 0 then
+          vim.cmd("silent! undojoin")
+          vim.cmd(string.format("keepjumps %dnormal! gqq", row))
+        end
+      end
+    end
+  end
+  return result
+end
 
 vim.g.vimtex_complete_bib = {
   menu = 1,
@@ -2069,6 +2077,107 @@ end
 
 
 -- ============================================================
+-- External agent bridge
+-- ============================================================
+local agent_server_file =
+  vim.fn.stdpath("state") .. "/agent-server.json"
+
+local function publish_agent_server()
+  vim.fn.mkdir(vim.fs.dirname(agent_server_file), "p")
+  vim.fn.writefile({
+    vim.json.encode({
+      server = vim.v.servername,
+      pid = vim.fn.getpid(),
+    }),
+  }, agent_server_file)
+end
+
+local function run_vimtex_forward_search()
+  if vim.bo.filetype ~= "tex" then
+    return false, "The target buffer is not a TeX buffer"
+  end
+  if vim.fn.exists(":VimtexView") ~= 2 then
+    return false, "VimtexView is not available"
+  end
+  vim.cmd("VimtexView")
+  return true
+end
+
+function _G.NvimAgentDispatch(encoded_request)
+  local ok_decode, decoded = pcall(vim.base64.decode, encoded_request)
+  if not ok_decode then
+    return vim.json.encode({ ok = false, error = "Invalid base64 request" })
+  end
+
+  local ok_json, request = pcall(vim.json.decode, decoded)
+  if not ok_json or type(request) ~= "table" then
+    return vim.json.encode({ ok = false, error = "Invalid JSON request" })
+  end
+  if type(request.file) ~= "string" or request.file == "" then
+    return vim.json.encode({ ok = false, error = "A target file is required" })
+  end
+
+  local filepath = vim.fs.normalize(request.file)
+  if vim.fn.filereadable(filepath) ~= 1 then
+    return vim.json.encode({
+      ok = false,
+      error = "Target file does not exist: " .. filepath,
+    })
+  end
+
+  vim.cmd("edit " .. vim.fn.fnameescape(filepath))
+  local comment = {
+    line = tonumber(request.line) or 1,
+    column = tonumber(request.column) or 1,
+    selectedText = request.selected_text or "",
+  }
+  local location = find_comment_location(
+    vim.api.nvim_get_current_buf(),
+    comment
+  )
+  local line_count = vim.api.nvim_buf_line_count(0)
+  local line = location and location.line
+    or math.min(math.max(comment.line, 1), line_count)
+  local column = location and location.column
+    or math.max(comment.column - 1, 0)
+  local line_text = vim.api.nvim_buf_get_lines(
+    0,
+    line - 1,
+    line,
+    false
+  )[1] or ""
+
+  column = math.min(column, #line_text)
+  vim.api.nvim_win_set_cursor(0, { line, column })
+  vim.cmd("normal! zz")
+
+  local forward_search_ran = false
+  local forward_search_error = nil
+  if request.forward_search == true then
+    forward_search_ran, forward_search_error = run_vimtex_forward_search()
+  end
+
+  return vim.json.encode({
+    ok = true,
+    file = filepath,
+    line = line,
+    column = column + 1,
+    forward_search = forward_search_ran,
+    forward_search_error = forward_search_error,
+  })
+end
+
+publish_agent_server()
+
+vim.api.nvim_create_user_command("AgentServerInfo", function()
+  vim.notify(
+    "Agent server: " .. vim.v.servername
+      .. "\nRendezvous: " .. agent_server_file
+  )
+end, {})
+
+
+-- ============================================================
 -- Telescope comments picker
 -- ============================================================
 
@@ -2709,49 +2818,48 @@ vim.keymap.set(
   }
 )
 
--- ============================================================
--- Autohotkey_latex
--- ============================================================
---
--- local ahk_job = nil
---
--- local autohotkey_exe =
---   "C:/Users/mattiaan/AppData/Local/Programs/AutoHotkey/v2/AutoHotkey64.exe"
---
--- local ahk_script =
---   "C:/Users/mattiaan/Documents/AutoHotkey/Paired sioyek + neovim.ahk"
---
--- -- Start AutoHotkey when a LaTeX file is opened
--- vim.api.nvim_create_autocmd({ "BufReadPost", "BufNewFile" }, {
---   pattern = { "*.tex", "*.bib" },
---
---   callback = function()
---     -- Already running for this Neovim instance
---     if ahk_job then
---       return
---     end
---
---     ahk_job = vim.fn.jobstart({
---       autohotkey_exe,
---       ahk_script,
---     })
---
---     if ahk_job <= 0 then
---       vim.notify(
---         "Failed to start AutoHotkey",
---         vim.log.levels.ERROR
---       )
---       ahk_job = nil
---     end
---   end,
--- })
---
--- -- Stop AutoHotkey when Neovim exits
--- vim.api.nvim_create_autocmd("VimLeavePre", {
---   callback = function()
---     if ahk_job then
---       vim.fn.jobstop(ahk_job)
---       ahk_job = nil
---     end
---   end,
--- })
+-- Filewatcher for bib
+--- Automatically synchronize Zotero bibliography for VimTeX projects
+local watchers = {}
+
+vim.api.nvim_create_autocmd("User", {
+    pattern = "VimtexEventInitPost",
+    callback = function()
+        local root = vim.b.vimtex and vim.b.vimtex.root
+        if not root then return end
+
+        -- Only for projects with main.tex
+        if vim.fn.filereadable(root .. "/main.tex") == 0 then
+            return
+        end
+
+        local script = root .. "/watch-bib.ps1"
+        if vim.fn.filereadable(script) == 0 then
+            return
+        end
+
+        -- Prevent duplicate watchers per project
+        if watchers[root] then return end
+
+        watchers[root] = vim.fn.jobstart({
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            script,
+        }, {
+            cwd = root,
+            on_exit = function()
+                watchers[root] = nil
+            end,
+        })
+    end,
+})
+
+vim.api.nvim_create_autocmd("VimLeavePre", {
+    callback = function()
+        for _, job in pairs(watchers) do
+            vim.fn.jobstop(job)
+        end
+    end,
+})
