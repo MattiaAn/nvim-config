@@ -78,9 +78,10 @@ Keys joined with `+` use a modifier when one is named, such as `Ctrl + Space`. L
 
 Python uses BasedPyright and Ruff for language-server features and diagnostics.
 Saving a Python file does not automatically fix, organize, or format its code.
-Neovim's Python provider selects `python3`, then `python`, from `PATH`; it is
-not tied to a specific Python version or installation path. Provider-dependent
-plugins require `pynvim` to be installed for the selected interpreter.
+Neovim's Python provider selects a real interpreter from `PATH` and ignores
+Microsoft Store aliases. On Windows it tries `python` before `python3`; on
+other systems it uses the reverse order. Provider-dependent plugins such as
+UltiSnips require `pynvim` to be installed for the selected interpreter.
 
 ## Code structure and folds
 

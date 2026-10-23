@@ -7,14 +7,17 @@ vim.opt.fileformats = { "unix", "dos" }
 vim.cmd("packadd nvim.undotree")
 vim.keymap.set("n", "<leader>u", require("undotree").open)
 
--- Neovim Python provider: use an available interpreter instead of a
--- machine- and version-specific path.
-local python3_host = vim.fn.exepath("python3")
-if python3_host == "" then
-  python3_host = vim.fn.exepath("python")
-end
-if python3_host ~= "" then
-  vim.g.python3_host_prog = python3_host
+-- Neovim Python provider: use a real interpreter from PATH instead of a
+-- machine- and version-specific path or a Microsoft Store app alias.
+local python_candidates = vim.fn.has("win32") == 1 and { "python", "python3" }
+  or { "python3", "python" }
+for _, command in ipairs(python_candidates) do
+  local path = vim.fn.exepath(command)
+  local is_windows_app_alias = path:lower():find("\\microsoft\\windowsapps\\", 1, true)
+  if path ~= "" and not is_windows_app_alias then
+    vim.g.python3_host_prog = path
+    break
+  end
 end
 -- Keep Unicode output intact for Python tools such as render-markdown's
 -- latex2text converter on Windows.
